@@ -38,7 +38,7 @@ N_RING_ACCOUNTS = 5
 MIN_PRIOR_TXNS_PER_RING_ACCOUNT = 8
 RING_CARD_ID = "CARD_INJECTED_01"
 RING_TXNS_PER_ACCOUNT = 6
-RING_AMOUNT_RANGE = (45000, 95000)
+RING_AMOUNT_RANGE = (60000, 150000)
 RING_DATE = datetime(2024, 6, 15)  # a Saturday
 RING_HOUR_RANGE = (2, 5)           # 02:00 to 05:00
 RING_LOCATION_STATE = "Lakshadweep"     # unusual — real dataset likely has few txns here
@@ -46,14 +46,18 @@ RING_LOCATION_CITY = "Kavaratti"
 RING_REASON = "Coordinated Ring Activity (injected)"
 
 
-def pick_ring_accounts(df: pd.DataFrame) -> list:
-    """Pick N accounts with enough history to have a meaningful baseline."""
-    counts = df.groupby("account").size()
+def pick_ring_accounts(df: pd.DataFrame, injection_time: pd.Timestamp) -> list:
+    """Pick N accounts with >= MIN_PRIOR_TXNS_PER_RING_ACCOUNT transactions
+    strictly BEFORE the injection timestamp. This ensures the per-account
+    baseline is genuine (not contaminated by the ring itself)."""
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    prior = df[df["timestamp"] < injection_time]
+    counts = prior.groupby("account").size()
     eligible = counts[counts >= MIN_PRIOR_TXNS_PER_RING_ACCOUNT].index.tolist()
     if len(eligible) < N_RING_ACCOUNTS:
         raise ValueError(
-            f"Only {len(eligible)} accounts have >= {MIN_PRIOR_TXNS_PER_RING_ACCOUNT} txns; "
-            f"need {N_RING_ACCOUNTS}."
+            f"Only {len(eligible)} accounts have >= {MIN_PRIOR_TXNS_PER_RING_ACCOUNT} txns "
+            f"before {injection_time}; need {N_RING_ACCOUNTS}."
         )
     return sorted(np.random.choice(eligible, N_RING_ACCOUNTS, replace=False).tolist())
 
@@ -119,7 +123,8 @@ def main():
     df = pd.read_csv(INPUT)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-    ring_accounts = pick_ring_accounts(df)
+    injection_time = pd.Timestamp(RING_DATE.replace(hour=RING_HOUR_RANGE[0], minute=0, second=0))
+    ring_accounts = pick_ring_accounts(df, injection_time)
     ring_merchant = pick_ring_merchant(df)
 
     ring_df = build_ring_transactions(df, ring_accounts, ring_merchant)
