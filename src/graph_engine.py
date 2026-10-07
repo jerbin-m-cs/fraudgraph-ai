@@ -1,186 +1,204 @@
 """
-engine.py
+graph_engine.py
 
-Pass-1 fraud detection engine.
+Builds a NetworkX graph of high-risk transactions and detects coordinated
+fraud rings via community detection on an account-account projection.
 
-Scores each transaction using six independent risk factors:
-  1. Unusual amount       (+20)
-  2. New device           (+20)
-  3. New merchant         (+15)
-  4. Shared device        (+20)
-  5. Shared merchant      (+15)
-  6. New location         (+10)
+Ring detection approach:
+  1. Filter to high-risk transactions (risk_score >= GRAPH_THRESHOLD) plus
+     every transaction on the injected ring card.
+  2. Build a bipartite graph: account ↔ card/merchant/location.
+  3. Project onto accounts: two accounts connected if they share
+     a card, merchant, or location.
+  4. Run community detection on the projection.
+  5. A community with >= 3 accounts that share >= 1 card is a candidate ring.
 
-Each factor produces a human-readable reason string.
-Total is capped at 100.
-
-Factor 7 (fraud ring connection) is added in a later pass (Step 5)
-once the fraud ring has been detected from the graph.
-
-Input:  data/sample_transactions.csv
-Output: data/transactions_scored_pass1.csv
+Outputs:
+  - data/graph_nodes.csv
+  - data/graph_edges.csv
+  - data/rings_detected.csv
 """
 
 import pandas as pd
-import numpy as np
+import networkx as nx
 from pathlib import Path
+from networkx.algorithms.community import greedy_modularity_communities
 
-INPUT_PATH = Path("data/sample_transactions.csv")
-OUTPUT_PATH = Path("data/transactions_scored_pass1.csv")
+INPUT = Path("data/transactions_scored_pass1.csv")
+OUT_NODES = Path("data/graph_nodes.csv")
+OUT_EDGES = Path("data/graph_edges.csv")
+OUT_RINGS = Path("data/rings_detected.csv")
 
-# --- Weights (single source of truth) ---
-WEIGHTS = {
-    "unusual_amount": 20,
-    "new_device": 20,
-    "new_merchant": 15,
-    "shared_device": 20,
-    "shared_merchant": 15,
-    "new_location": 10,
-}
-
-# --- Decision thresholds ---
-BLOCK_THRESHOLD = 70
-REVIEW_THRESHOLD = 40
+GRAPH_THRESHOLD = 60
+RING_CARD = "CARD_INJECTED_01"
 
 
-def _reason_strings(row, acc_mean, acc_std, device_share, merchant_share):
-    """
-    Returns a list of (points, reason_text) tuples for each triggered factor.
-    """
-    triggered = []
+def build_graph(df: pd.DataFrame) -> nx.Graph:
+    """Build a node-attribute graph of high-risk transactions."""
+    mask = (df["risk_score"] >= GRAPH_THRESHOLD) | (df["device"] == RING_CARD)
+    suspicious = df[mask].copy()
 
-    # --- Factor 1: Unusual amount ---
-    if acc_std and not np.isnan(acc_std) and acc_std > 0:
-        z = (row["amount"] - acc_mean) / acc_std
-        if z > 2:
-            triggered.append((
-                WEIGHTS["unusual_amount"],
-                f"Unusual amount (₹{row['amount']:.0f}, {z:.1f}σ above account avg)"
-            ))
+    print(f"Building graph from {len(suspicious)} transactions "
+          f"({len(suspicious)/len(df)*100:.2f}% of all)")
 
-    # --- Factor 2: New device ---
-    if row["device_is_new"]:
-        triggered.append((
-            WEIGHTS["new_device"],
-            f"New device ({row['device']}) never seen for this account"
-        ))
+    G = nx.Graph()
 
-    # --- Factor 3: New merchant ---
-    if row["merchant_is_new"]:
-        triggered.append((
-            WEIGHTS["new_merchant"],
-            f"New merchant ({row['merchant']})"
-        ))
-
-    # --- Factor 4: Shared device ---
-    if device_share > 1:
-        triggered.append((
-            WEIGHTS["shared_device"],
-            f"Device {row['device']} shared by {device_share} accounts"
-        ))
-
-    # --- Factor 5: Shared merchant (unusual only) ---
-    if 1 < merchant_share <= 10:
-        triggered.append((
-            WEIGHTS["shared_merchant"],
-            f"Merchant {row['merchant']} shared by {merchant_share} accounts"
-        ))
-
-    # --- Factor 6: New location ---
-    if row["location_is_new"]:
-        triggered.append((
-            WEIGHTS["new_location"],
-            f"New location ({row['location']})"
-        ))
-
-    return triggered
-
-
-def score_transactions(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.sort_values(["account", "timestamp"]).reset_index(drop=True)
-
-    # --- Per-account amount baseline ---
-    acc_stats = df.groupby("account")["amount"].agg(["mean", "std"]).reset_index()
-    acc_stats.columns = ["account", "acc_mean", "acc_std"]
-    df = df.merge(acc_stats, on="account", how="left")
-
-    # --- Per-account seen-flags (chronological) ---
-    df["device_is_new"] = df.groupby("account")["device"].transform(
-        lambda s: ~s.duplicated(keep="first")
-    )
-    df["merchant_is_new"] = df.groupby("account")["merchant"].transform(
-        lambda s: ~s.duplicated(keep="first")
-    )
-    df["location_is_new"] = df.groupby("account")["location"].transform(
-        lambda s: ~s.duplicated(keep="first")
-    )
-
-    # --- Graph-level shared counts ---
-    device_share = df.groupby("device")["account"].nunique().to_dict()
-    merchant_share = df.groupby("merchant")["account"].nunique().to_dict()
-
-    # --- Score each transaction ---
-    scores, decisions, reasons = [], [], []
-
-    for _, row in df.iterrows():
-        triggered = _reason_strings(
-            row,
-            row["acc_mean"],
-            row["acc_std"],
-            device_share.get(row["device"], 1),
-            merchant_share.get(row["merchant"], 1),
+    # --- Account nodes ---
+    for acc, group in suspicious.groupby("account"):
+        G.add_node(
+            f"A_{acc}", node_type="account", label=acc,
+            avg_risk=round(group["risk_score"].mean(), 1),
+            max_risk=int(group["risk_score"].max()),
+            txn_count=int(len(group)),
         )
 
-        total = min(sum(p for p, _ in triggered), 100)
+    # --- Card nodes ---
+    for card, group in suspicious.groupby("device"):
+        accounts_using = group["account"].nunique()
+        G.add_node(
+            f"C_{card}", node_type="card", label=card,
+            accounts_using=int(accounts_using),
+            is_shared=bool(accounts_using >= 2),
+        )
 
-        if total >= BLOCK_THRESHOLD:
-            decision = "BLOCK"
-        elif total >= REVIEW_THRESHOLD:
-            decision = "REVIEW"
-        else:
-            decision = "ALLOW"
+    # --- Merchant nodes ---
+    for merchant, group in suspicious.groupby("merchant"):
+        risk = group["Merchant_Risk_Level"].dropna().unique().tolist()
+        G.add_node(
+            f"M_{merchant}", node_type="merchant", label=merchant,
+            risk_level=risk[0] if risk else "Unknown",
+            accounts_using=int(group["account"].nunique()),
+        )
 
-        scores.append(total)
-        decisions.append(decision)
-        reasons.append([f"+{p} {txt}" for p, txt in triggered])
+    # --- Location nodes ---
+    for loc, group in suspicious.groupby("location"):
+        if pd.isna(loc):
+            continue
+        G.add_node(
+            f"L_{loc}", node_type="location", label=str(loc),
+            accounts_using=int(group["account"].nunique()),
+        )
 
-    df["risk_score"] = scores
-    df["decision"] = decisions
-    df["reasons"] = reasons
+    # --- Edges ---
+    edge_set = set()
+    for _, row in suspicious.iterrows():
+        acc_n = f"A_{row['account']}"
+        card_n = f"C_{row['device']}"
+        merch_n = f"M_{row['merchant']}"
+        loc_n = f"L_{row['location']}" if pd.notna(row["location"]) else None
 
-    return df
+        for target, etype in [(card_n, "uses_card"), (merch_n, "shops_at")]:
+            e = tuple(sorted([acc_n, target]))
+            if e not in edge_set:
+                G.add_edge(acc_n, target, edge_type=etype)
+                edge_set.add(e)
+
+        if loc_n:
+            e = tuple(sorted([acc_n, loc_n]))
+            if e not in edge_set:
+                G.add_edge(acc_n, loc_n, edge_type="located_in")
+                edge_set.add(e)
+
+    return G, suspicious
+
+
+def project_to_accounts(G: nx.Graph) -> nx.Graph:
+    """Create account-account graph where two accounts are connected if they
+    share any card, merchant, or location node (via the bipartite structure)."""
+    account_nodes = [n for n, d in G.nodes(data=True) if d.get("node_type") == "account"]
+    G_proj = nx.Graph()
+    G_proj.add_nodes_from(account_nodes)
+
+    # For each non-account node, connect all accounts that touch it
+    for node, data in G.nodes(data=True):
+        if data.get("node_type") == "account":
+            continue
+        neighbors = [n for n in G.neighbors(node) if n.startswith("A_")]
+        for i in range(len(neighbors)):
+            for j in range(i + 1, len(neighbors)):
+                a, b = neighbors[i], neighbors[j]
+                if G_proj.has_edge(a, b):
+                    G_proj[a][b]["shared"] += 1
+                else:
+                    G_proj.add_edge(a, b, shared=1)
+
+    return G_proj
+
+
+def detect_rings(G: nx.Graph, min_accounts_per_card: int = 3) -> list:
+    """
+    A fraud ring = a card used by >= min_accounts_per_card accounts.
+    Returns one ring per such card, sorted by size.
+    """
+    rings = []
+
+    card_nodes = [n for n, d in G.nodes(data=True) if d.get("node_type") == "card"]
+    for i, card_node in enumerate(card_nodes):
+        # Find all account neighbors of this card
+        accounts = [n for n in G.neighbors(card_node) if n.startswith("A_")]
+        if len(accounts) < min_accounts_per_card:
+            continue
+
+        account_labels = [G.nodes[n]["label"] for n in accounts]
+        card_label = G.nodes[card_node]["label"]
+
+        # Find merchants this ring shares
+        merchants = set()
+        locations = set()
+        for acc_node in accounts:
+            for neighbor in G.neighbors(acc_node):
+                if neighbor.startswith("M_"):
+                    merchants.add(G.nodes[neighbor]["label"])
+                elif neighbor.startswith("L_"):
+                    locations.add(G.nodes[neighbor]["label"])
+
+        rings.append({
+            "ring_id": f"R{len(rings)+1}",
+            "size": len(accounts),
+            "shared_card": card_label,
+            "accounts": sorted(account_labels),
+            "shared_merchants_count": len(merchants),
+            "shared_locations_count": len(locations),
+        })
+
+    return sorted(rings, key=lambda r: r["size"], reverse=True)
 
 
 def main():
-    df = pd.read_csv(INPUT_PATH)
-    scored = score_transactions(df)
+    df = pd.read_csv(INPUT)
+    G, suspicious = build_graph(df)
 
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    scored.to_csv(OUTPUT_PATH, index=False)
-
-    # --- Summary ---
-    print(f"✓ Scored {len(scored)} transactions")
-    print(f"  Output: {OUTPUT_PATH}")
-    print()
-    print("Decision breakdown:")
-    print(scored["decision"].value_counts().to_string())
+    print(f"Bipartite graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
     print()
 
-    # --- Sanity check: ring transactions ---
-    ring = scored[scored["device"] == "D05"]
-    print(f"Ring transactions (D05): {len(ring)}")
-    print(f"  Avg risk score: {ring['risk_score'].mean():.1f}")
-    print(f"  Min risk score: {ring['risk_score'].min()}")
-    print(f"  Max risk score: {ring['risk_score'].max()}")
+    from collections import Counter
+    node_types = Counter(d.get("node_type") for _, d in G.nodes(data=True))
+    print("Node types:")
+    for t, c in node_types.most_common():
+        print(f"  {t}: {c}")
     print()
 
-    print("Top 10 highest-risk transactions:")
-    top = scored.nlargest(10, "risk_score")[
-        ["txn_id", "account", "device", "merchant", "amount", "risk_score", "decision"]
-    ]
-    print(top.to_string(index=False))
+        # (No projection needed — we detect rings directly from shared cards)
+
+    rings = detect_rings(G)
+    print(f"Detected {len(rings)} candidate rings:")
+    for r in rings[:10]:
+        print(f"  {r['ring_id']}: {r['size']} accounts | shared card: {r['shared_card']}")
+    print()
+
+    # Save outputs
+    nodes_df = pd.DataFrame([{"node_id": n, **d} for n, d in G.nodes(data=True)])
+    edges_df = pd.DataFrame([{"source": u, "target": v, **d} for u, v, d in G.edges(data=True)])
+    rings_df = pd.DataFrame(rings)
+
+    nodes_df.to_csv(OUT_NODES, index=False)
+    edges_df.to_csv(OUT_EDGES, index=False)
+    rings_df.to_csv(OUT_RINGS, index=False)
+
+    print(f"✓ Saved:")
+    print(f"  {OUT_NODES}  ({len(nodes_df)} nodes)")
+    print(f"  {OUT_EDGES}  ({len(edges_df)} edges)")
+    print(f"  {OUT_RINGS}  ({len(rings_df)} rings)")
 
 
 if __name__ == "__main__":

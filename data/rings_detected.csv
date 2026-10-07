@@ -1,0 +1,2 @@
+ring_id,size,shared_card,accounts,shared_merchants_count,shared_locations_count
+R1,5,CARD_INJECTED_01,"['CUST103041', 'CUST103073', 'CUST108403', 'CUST109187', 'CUST114608']",2,2
