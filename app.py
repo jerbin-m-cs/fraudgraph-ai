@@ -5,16 +5,16 @@ Tabs:
   Overview      — summary metrics and ring detection status
   Transactions  — top-scored transactions with reason breakdown
   Accounts      — accounts ranked by risk
-  Network       — subgraph of the detected ring
+  Network       — subgraph of the detected ring (Plotly, deterministic colors)
   Investigation — pick a transaction, see the full explanation and action
 """
 
 import ast
+import numpy as np
 import streamlit as st
 import pandas as pd
 import networkx as nx
-from pyvis.network import Network
-import streamlit.components.v1 as components
+import plotly.graph_objects as go
 
 # ------- Page config -------
 st.set_page_config(
@@ -31,14 +31,11 @@ RING_CARD = "CARD_INJECTED_01"
 # ------- Custom CSS -------
 st.markdown("""
 <style>
-    /* Tighten page padding */
     .block-container { padding-top: 2rem; padding-bottom: 2rem; max-width: 1400px; }
 
-    /* Header */
     h1 { font-size: 2rem !important; font-weight: 700 !important; margin-bottom: 0.1rem !important; }
     .subtitle { color: #6b7280; font-size: 0.95rem; margin-bottom: 1.5rem; }
 
-    /* KPI cards */
     .kpi-card {
         background: #f8fafc;
         border: 1px solid #e5e7eb;
@@ -66,7 +63,6 @@ st.markdown("""
         color: #6b7280;
     }
 
-    /* Section headers */
     .section-header {
         font-size: 1.1rem;
         font-weight: 700;
@@ -76,7 +72,6 @@ st.markdown("""
         border-bottom: 1px solid #e5e7eb;
     }
 
-    /* Chips */
     .chip {
         display: inline-block;
         background: #eef2ff;
@@ -89,13 +84,11 @@ st.markdown("""
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     }
 
-    /* Status badges */
     .badge-block { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; padding: 3px 10px; border-radius: 6px; font-weight: 600; font-size: 0.85rem; display:inline-block;}
     .badge-review { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; padding: 3px 10px; border-radius: 6px; font-weight: 600; font-size: 0.85rem; display:inline-block;}
     .badge-allow { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; padding: 3px 10px; border-radius: 6px; font-weight: 600; font-size: 0.85rem; display:inline-block;}
     .badge-ok { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; padding: 3px 10px; border-radius: 6px; font-weight: 600; font-size: 0.85rem; display:inline-block;}
 
-    /* Info card for detection summary */
     .info-card {
         background: #f8fafc;
         border: 1px solid #e5e7eb;
@@ -124,7 +117,6 @@ def load_data():
 
 
 def safe_list(val):
-    """rings['accounts'] is stored as a string repr of a list from CSV."""
     if isinstance(val, list):
         return val
     try:
@@ -187,7 +179,6 @@ with tab_overview:
             <div class="kpi-delta">coordinated groups detected</div>
         </div>""", unsafe_allow_html=True)
 
-    # --- Ring status card ---
     st.markdown('<div class="section-header">🎯 Injected Ring — Detection Status</div>', unsafe_allow_html=True)
 
     ring_txns = df[df["device"] == RING_CARD]
@@ -222,7 +213,6 @@ with tab_overview:
     else:
         st.warning("No injected ring transactions found.")
 
-    # --- Detection summary card ---
     st.markdown('<div class="section-header">📋 Detection Summary</div>', unsafe_allow_html=True)
     st.markdown("""
     <div class="info-card">
@@ -322,58 +312,122 @@ with tab_accounts:
 # ================= NETWORK =================
 with tab_network:
     st.markdown('<div class="section-header">Fraud Ring Network</div>', unsafe_allow_html=True)
-    st.caption("Accounts (red) connected to shared cards (blue), merchants (green), and locations (purple).")
+    st.caption("Accounts (red) connected to the shared card (blue), merchant (green), and location (purple). "
+               "Only the injected ring transactions are shown.")
 
     if len(rings) == 0:
         st.warning("No ring detected.")
     else:
         ring_accs = safe_list(rings.iloc[0]["accounts"])
-        ring_df = df[df["account"].isin(ring_accs)]
+        ring_df = df[(df["account"].isin(ring_accs)) & (df["device"] == RING_CARD)]
 
-        G = nx.Graph()
+        # ---- Collect unique nodes with their types ----
+        nodes = {}   # node_id -> {"label": ..., "type": ...}
+        edges = []   # list of (source_id, target_id)
+
         for _, row in ring_df.iterrows():
-            acc_node = f"A_{row['account']}"
-            card_node = f"C_{row['device']}"
-            merch_node = f"M_{row['merchant']}"
-            loc_node = f"L_{row['location']}" if pd.notna(row["location"]) else None
+            acc_id = f"A_{row['account']}"
+            card_id = f"C_{row['device']}"
+            merch_id = f"M_{row['merchant']}"
 
-            G.add_node(acc_node, group="account", color="#e74c3c",
-                       label=row["account"], title="Account", size=24)
-            G.add_node(card_node, group="card", color="#3498db",
-                       label=row["device"], title="Card", size=32)
-            G.add_node(merch_node, group="merchant", color="#2ecc71",
-                       label=row["merchant"], title="Merchant", size=28)
-            if loc_node:
-                G.add_node(loc_node, group="location", color="#9b59b6",
-                           label=str(row["location"]), title="Location", size=28)
+            nodes[acc_id] = {"label": row["account"], "type": "account"}
+            nodes[card_id] = {"label": row["device"], "type": "card"}
+            nodes[merch_id] = {"label": row["merchant"], "type": "merchant"}
 
-            G.add_edge(acc_node, card_node)
-            G.add_edge(acc_node, merch_node)
-            if loc_node:
-                G.add_edge(acc_node, loc_node)
+            edges.append((acc_id, card_id))
+            edges.append((acc_id, merch_id))
 
-        net = Network(height="620px", width="100%", bgcolor="#ffffff",
-                      font_color="#111", directed=False)
-        net.from_nx(G)
-        net.set_options("""
-        var options = {
-          "physics": {"stabilization": {"iterations": 200}},
-          "nodes": {
-            "font": {"size": 14, "color": "#111827"},
-            "borderWidth": 2
-          },
-          "edges": {
-            "color": {"color": "#cbd5e1"},
-            "width": 1.5,
-            "smooth": false
-          }
+            if pd.notna(row["location"]):
+                loc_id = f"L_{row['location']}"
+                nodes[loc_id] = {"label": str(row["location"]), "type": "location"}
+                edges.append((acc_id, loc_id))
+
+        # ---- Layout: accounts on a circle, hub nodes near center ----
+        account_ids = [nid for nid, d in nodes.items() if d["type"] == "account"]
+        hub_ids = [nid for nid, d in nodes.items() if d["type"] != "account"]
+
+        pos = {}
+        n_acc = len(account_ids)
+        for i, nid in enumerate(account_ids):
+            angle = 2 * np.pi * i / n_acc
+            pos[nid] = (np.cos(angle), np.sin(angle))
+        for i, nid in enumerate(hub_ids):
+            offset = (i - (len(hub_ids) - 1) / 2) * 0.18
+            pos[nid] = (offset, offset * 0.4)
+
+        # ---- Edge trace ----
+        edge_x, edge_y = [], []
+        for src, dst in edges:
+            x0, y0 = pos[src]
+            x1, y1 = pos[dst]
+            edge_x.extend([x0, x1, None])
+            edge_y.extend([y0, y1, None])
+
+        edge_trace = go.Scatter(
+            x=edge_x, y=edge_y,
+            line=dict(width=1.5, color="#cbd5e1"),
+            hoverinfo="none",
+            mode="lines",
+            showlegend=False,
+        )
+
+        # ---- Node traces (one per type for the legend) ----
+        type_colors = {
+            "account":  "#e74c3c",
+            "card":     "#3498db",
+            "merchant": "#2ecc71",
+            "location": "#9b59b6",
         }
-        """)
+        type_labels = {
+            "account":  "Account",
+            "card":     "Shared Card",
+            "merchant": "Merchant",
+            "location": "Location",
+        }
+        type_sizes = {"account": 30, "card": 46, "merchant": 38, "location": 38}
 
-        html_file = "data/ring_graph.html"
-        net.save_graph(html_file)
-        with open(html_file, "r", encoding="utf-8") as f:
-            components.html(f.read(), height=640, scrolling=False)
+        node_traces = []
+        for ntype in ["account", "card", "merchant", "location"]:
+            ids = [nid for nid, d in nodes.items() if d["type"] == ntype]
+            if not ids:
+                continue
+            node_traces.append(go.Scatter(
+                x=[pos[nid][0] for nid in ids],
+                y=[pos[nid][1] for nid in ids],
+                mode="markers+text",
+                text=[nodes[nid]["label"] for nid in ids],
+                textposition="bottom center",
+                textfont=dict(size=13, color="#111827"),
+                marker=dict(
+                    size=type_sizes[ntype],
+                    color=type_colors[ntype],
+                    line=dict(width=2, color="#ffffff"),
+                ),
+                hoverinfo="text",
+                hovertext=[f"{type_labels[ntype]}: {nodes[nid]['label']}" for nid in ids],
+                name=type_labels[ntype],
+                showlegend=True,
+            ))
+
+        fig = go.Figure(data=[edge_trace] + node_traces)
+        fig.update_layout(
+            showlegend=True,
+            hovermode="closest",
+            margin=dict(b=20, l=20, r=20, t=20),
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            plot_bgcolor="#ffffff",
+            paper_bgcolor="#ffffff",
+            height=600,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom", y=1.02,
+                xanchor="left", x=0,
+                bgcolor="rgba(255,255,255,0.9)",
+            ),
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
 
         st.markdown(
             f"**Ring accounts:** {len(ring_accs)} &nbsp;·&nbsp; "
@@ -390,7 +444,6 @@ with tab_investigate:
     ring_txns = df[df["device"] == RING_CARD]
     default_id = ring_txns.iloc[0]["txn_id"] if len(ring_txns) > 0 else df.iloc[0]["txn_id"]
 
-    # Small pool for responsiveness; ring txns always included
     pool = pd.concat([
         ring_txns,
         df[df["decision"] == "BLOCK"].head(500),
